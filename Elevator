@@ -1,0 +1,424 @@
+import pygame
+import sys
+import random
+
+# ---------------------- Console: ask floors (one-shot) ----------------------
+print("Hello welcome to my elevator algorithm! Please let me know how many floors ur building has?")
+while True:
+    try:
+        floors = int(input())
+        if floors >= 1:
+            break
+        print("Please enter integer >= 1")
+    except ValueError:
+        print("Please enter an integer.")
+print(f"Ah I see ur building has {floors} floors")
+print("Lets run this simulator!")
+# --------------------------------------------------------------------------
+
+pygame.init()
+screen = pygame.display.set_mode((1280, 720))
+pygame.display.set_caption("Jet's Elevator Simulator - Highest-first priority")
+clock = pygame.time.Clock()
+font = pygame.font.Font(None, 24)
+
+# Layout / geometry
+shaft_x = 1100
+shaft_top = 40
+shaft_height = 620
+shaft_w = 120
+pixels_per_floor = shaft_height / max(1, floors)
+car_w = shaft_w - 12
+car_h = int(pixels_per_floor - 6) if pixels_per_floor >= 8 else 20
+
+# Movement timing -> pixel speed
+seconds_per_floor = 0.9
+pixels_per_second = pixels_per_floor / seconds_per_floor
+
+# Convert floor number to top-left pixel y
+def floor_to_y_pixel(floor):
+    return int(shaft_top + (floors - floor) * pixels_per_floor + 3)
+
+# Scheduler state
+current_floor = 1
+car_y = float(floor_to_y_pixel(current_floor))
+target_floor = None
+target_y = None
+door_timer = 0.0
+DOOR_OPEN_SEC = 1.0
+
+# Request containers (sets avoid duplicates)
+up_requests = set()
+down_requests = set()
+direction = 0   # 1 up, -1 down, 0 idle
+
+# Passenger destinations waiting to be applied when picked up:
+passenger_destinations = {}
+
+# Input box (left)
+input_box = pygame.Rect(10, 100, 360, 36)
+input_active = False
+input_text = ""
+caret_visible = True
+caret_timer = 0.0
+CARET_BLINK = 0.45
+
+# Automated requests
+request_accum = 0.0
+REQUEST_INTERVAL = 5.0  # adjust frequency
+
+last_msg = "Highest-first: elevator will go to highest requested floor above current when choosing next target."
+
+# ---------- helper: compute logical trajectory (list of floors in service order) ----------
+def compute_trajectory(curr_floor, dirn, ups, downs):
+    ups_c = sorted(set(ups))
+    downs_c = sorted(set(downs), reverse=True)
+    traj = []
+    if dirn == 1:
+        for f in ups_c:
+            if f >= curr_floor:
+                traj.append(f)
+        for f in ups_c:
+            if f < curr_floor:
+                traj.append(f)
+        traj.extend(downs_c)
+    elif dirn == -1:
+        for f in downs_c:
+            if f <= curr_floor:
+                traj.append(f)
+        for f in downs_c:
+            if f > curr_floor:
+                traj.append(f)
+        traj.extend(ups_c)
+    else:
+        all_reqs = sorted(list(ups) + list(downs))
+        remaining = sorted(all_reqs, key=lambda x: (abs(x - curr_floor), x))
+        traj = remaining
+    seen = set()
+    clean = []
+    for f in traj:
+        if f not in seen:
+            clean.append(f)
+            seen.add(f)
+    return clean
+
+# ---------- choose_next_target (HIGHEST-FIRST) ----------
+# ---------- choose_next_target (HIGHEST-FIRST, prefer continuing current dir) ----------
+# ---------- choose_next_target (LOOK / SCAN - normal elevator) ----------
+def choose_next_target():
+    """Normal elevator behaviour (LOOK/SCAN):
+       - Continue current direction and serve requests encountered in that direction.
+       - When no more requests exist in current direction, reverse (LOOK behaviour).
+       - If idle, pick the nearest request and set direction toward it.
+    """
+    global direction, target_floor, target_y, last_msg
+
+    # No requests -> idle
+    if not up_requests and not down_requests:
+        direction = 0
+        target_floor = None
+        target_y = None
+        last_msg = "No requests -> idle"
+        return
+
+    # Helper helpers
+    ups_sorted = sorted(set(up_requests))
+    downs_sorted = sorted(set(down_requests), reverse=True)
+
+    # If currently moving UP, try to continue serving up-requests >= current_floor
+    if direction == 1:
+        upward_candidates = [f for f in ups_sorted if f >= current_floor]
+        if upward_candidates:
+            next_floor = min(upward_candidates)  # nearest upward stop
+            target_floor = next_floor
+            target_y = floor_to_y_pixel(next_floor)
+            last_msg = f"Continue up to {next_floor}"
+            return
+        # no up candidates ahead -> if there are any down requests, reverse to down
+        if down_requests:
+            direction = -1
+            # choose the nearest down request (highest below current if exists)
+            below = [f for f in down_requests if f <= current_floor]
+            if below:
+                next_floor = max(below)
+            else:
+                next_floor = min(down_requests, key=lambda f: abs(f - current_floor))
+            target_floor = next_floor
+            target_y = floor_to_y_pixel(next_floor)
+            last_msg = f"No up requests -> reverse to down and go to {next_floor}"
+            return
+        # fallback: maybe there are up_requests but all < current_floor (rare). handle below:
+        if up_requests:
+            # serve upward requests that are below current_floor after finishing loop (choose nearest)
+            next_floor = min(up_requests, key=lambda f: abs(f - current_floor))
+            direction = 1 if next_floor > current_floor else -1
+            target_floor = next_floor
+            target_y = floor_to_y_pixel(next_floor)
+            last_msg = f"Edge: pick {next_floor}"
+            return
+
+    # If currently moving DOWN, try to continue serving down-requests <= current_floor
+    if direction == -1:
+        downward_candidates = [f for f in downs_sorted if f <= current_floor]
+        if downward_candidates:
+            next_floor = max(downward_candidates)  # nearest downward stop (largest <= curr)
+            target_floor = next_floor
+            target_y = floor_to_y_pixel(next_floor)
+            last_msg = f"Continue down to {next_floor}"
+            return
+        # no down candidates ahead -> if there are any up requests, reverse to up
+        if up_requests:
+            direction = 1
+            above = [f for f in up_requests if f >= current_floor]
+            if above:
+                next_floor = min(above)
+            else:
+                next_floor = min(up_requests, key=lambda f: abs(f - current_floor))
+            target_floor = next_floor
+            target_y = floor_to_y_pixel(next_floor)
+            last_msg = f"No down requests -> reverse to up and go to {next_floor}"
+            return
+        # fallback: maybe there are down_requests but all > current_floor (rare)
+        if down_requests:
+            next_floor = min(down_requests, key=lambda f: abs(f - current_floor))
+            direction = 1 if next_floor > current_floor else -1
+            target_floor = next_floor
+            target_y = floor_to_y_pixel(next_floor)
+            last_msg = f"Edge: pick {next_floor}"
+            return
+
+    # If idle (direction == 0), pick the nearest request and set direction toward it
+    if direction == 0:
+        all_reqs = list(up_requests) + list(down_requests)
+        if all_reqs:
+            nearest = min(all_reqs, key=lambda x: (abs(x - current_floor), x))
+            target_floor = nearest
+            target_y = floor_to_y_pixel(nearest)
+            direction = 1 if nearest > current_floor else -1
+            last_msg = f"Idle -> picked nearest {nearest} dir {'Up' if direction==1 else 'Down'}"
+            return
+
+    # Safety fallback
+    all_reqs = sorted(list(up_requests) + list(down_requests), key=lambda x: (abs(x - current_floor), x))
+    if all_reqs:
+        target_floor = all_reqs[0]
+        target_y = floor_to_y_pixel(target_floor)
+        direction = 1 if target_floor > current_floor else -1
+        last_msg = f"Fallback pick {target_floor}"
+    else:
+        direction = 0
+        target_floor = None
+        target_y = None
+        last_msg = "Fallback -> idle"
+
+
+# ---------- Internal destination helper ----------
+def add_destination(dest):
+    """Add an internal destination (a passenger inside pressed a floor button)."""
+    global target_floor, target_y, direction, last_msg
+    if dest == current_floor:
+        last_msg = f"Internal dest {dest} equals current floor -> doors open"
+        return
+    if dest > current_floor:
+        up_requests.add(dest)
+    else:
+        down_requests.add(dest)
+    if target_floor is None:
+        choose_next_target()
+
+# ---------- Modified add_request (no mid-flight change) ----------
+def add_request(floor):
+    """Add an external call request (someone pressed the call button on a floor).
+       Universal rule: callers at floors > 2 want to go to floor 1.
+       Do NOT force mid-flight direction changes.
+    """
+    global direction, target_floor, target_y, door_timer, last_msg
+
+    if floor == current_floor:
+        door_timer = DOOR_OPEN_SEC
+        last_msg = f"Request at current floor {floor} -> doors open"
+        if floor > 2:
+            passenger_destinations.setdefault(floor, set()).add(1)
+            add_destination(1)
+        return
+
+    # External call: for floors > 2, callers want to go to 1 (so they are down-calls)
+    if floor > 2:
+        down_requests.add(floor)
+        passenger_destinations.setdefault(floor, set()).add(1)
+    else:
+        if floor > current_floor:
+            up_requests.add(floor)
+        else:
+            down_requests.add(floor)
+
+    # If elevator is idle (not moving), pick direction/target immediately.
+    # If mid-move (target_floor not None), just queue request (will be considered at next floor).
+    if target_floor is None:
+        if direction == 0:
+            all_reqs = sorted(list(up_requests) + list(down_requests))
+            if all_reqs:
+                nearest = min(all_reqs, key=lambda x: (abs(x - current_floor), x))
+                direction = 1 if nearest > current_floor else -1
+        choose_next_target()
+    else:
+        last_msg = f"Request queued: {floor} (will be considered after arrival)"
+
+# ---------- Main loop ----------
+running = True
+while running:
+    dt = clock.tick(60) / 1000.0
+    caret_timer += dt
+    if caret_timer >= CARET_BLINK:
+        caret_visible = not caret_visible
+        caret_timer -= CARET_BLINK
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            input_active = input_box.collidepoint(event.pos)
+
+        elif event.type == pygame.KEYDOWN and input_active:
+            if event.key == pygame.K_BACKSPACE:
+                input_text = input_text[:-1]
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                cmd = input_text.strip().lower()
+                if cmd == "exit":
+                    pygame.quit()
+                    sys.exit()
+                else:
+                    last_msg = f"Cmd: {input_text}"
+                input_text = ""
+            elif event.key == pygame.K_ESCAPE:
+                input_text = ""
+            else:
+                if event.unicode and ord(event.unicode) >= 32:
+                    input_text += event.unicode
+
+        elif event.type == pygame.KEYDOWN:
+            # manual numeric single-digit request (quick)
+            if event.unicode.isdigit():
+                n = int(event.unicode)
+                if 1 <= n <= floors:
+                    add_request(n)
+                    last_msg = f"Manual request: floor {n}"
+            # press 'r' for immediate random request
+            if event.key == pygame.K_r:
+                rf = random.randint(1, floors)
+                add_request(rf)
+                last_msg = f"Random request immediate: {rf}"
+
+    # Automated periodic requests (adds even while moving)
+    request_accum += dt
+    if request_accum >= REQUEST_INTERVAL:
+        rf = random.randint(1, floors)
+        add_request(rf)
+        last_msg = f"Auto-request: {rf}"
+        request_accum = 0.0
+
+    # If no current target, pick next according to scheduler
+    if target_floor is None:
+        choose_next_target()
+
+    # Movement (pixel-level)
+    if door_timer > 0.0:
+        door_timer -= dt
+        if door_timer <= 0.0:
+            door_timer = 0.0
+            last_msg = f"Doors closed. Idle at floor {current_floor}."
+    elif target_floor is not None:
+        # move car_y toward target_y smoothly
+        dir_sign = 1 if target_y > car_y else -1
+        delta = pixels_per_second * dt * dir_sign
+        car_y += delta
+        # check arrival
+        if (dir_sign == 1 and car_y >= target_y) or (dir_sign == -1 and car_y <= target_y):
+            car_y = target_y
+            arrived = target_floor
+            # clear the served request if present
+            if arrived in up_requests:
+                up_requests.discard(arrived)
+            if arrived in down_requests:
+                down_requests.discard(arrived)
+            current_floor = arrived
+            target_floor = None
+            target_y = None
+
+            # handle passenger pickups and ensure >2 callers want floor 1
+            if arrived in passenger_destinations:
+                dests = passenger_destinations.pop(arrived)
+            else:
+                dests = set()
+            if arrived > 2:
+                dests.add(1)
+            for d in dests:
+                add_destination(d)
+            if dests:
+                last_msg = f"Picked up passengers at {arrived}, queued destinations {sorted(dests)}"
+            else:
+                last_msg = f"Arrived at floor {current_floor}. Doors open."
+
+            door_timer = DOOR_OPEN_SEC
+            # After arrival, choose next target (re-evaluate; only at floor boundaries)
+            choose_next_target()
+
+    # HUD trajectory preview (logical)
+    traj = compute_trajectory(current_floor, direction, up_requests, down_requests)
+
+    # DRAW
+    screen.fill((200, 200, 200))
+    # shaft & floors
+    pygame.draw.rect(screen, (180,180,180), (shaft_x, shaft_top, shaft_w, shaft_height))
+    for i in range(floors):
+        y = int(shaft_top + i * pixels_per_floor)
+        pygame.draw.line(screen, (100,100,100), (shaft_x, y), (shaft_x + shaft_w, y), 2)
+        floor_num = floors - i
+        lbl = font.render(str(floor_num), True, (0,0,0))
+        screen.blit(lbl, (shaft_x + shaft_w + 6, y - 10))
+
+    # elevator car
+    car_x = shaft_x + 6
+    pygame.draw.rect(screen, (60,60,140), (car_x, int(car_y), car_w, car_h))
+    if door_timer > 0:
+        screen.blit(font.render("OPEN", True, (255,255,255)), (car_x + 6, int(car_y) + 6))
+
+    # HUD text
+    screen.blit(font.render(f"Current floor: {current_floor}", True, (0,0,0)), (10, 10))
+    screen.blit(font.render(f"Direction: {'Up' if direction==1 else 'Down' if direction==-1 else 'Idle'}", True, (0,0,0)), (10, 36))
+    screen.blit(font.render(f"Pending UP: {sorted(up_requests)}", True, (0,0,0)), (10, 62))
+    screen.blit(font.render(f"Pending DOWN: {sorted(down_requests)}", True, (0,0,0)), (10, 88))
+    screen.blit(font.render(f"Trajectory: {traj}", True, (0,0,0)), (10, 114))
+    screen.blit(font.render(last_msg, True, (0,0,0)), (10, 140))
+
+    # show pending passenger destinations waiting at pickup floors
+    pd_list = ", ".join(f"{pf}-> {sorted(dests)}" for pf, dests in passenger_destinations.items())
+    screen.blit(font.render(f"Waiting pickups: {pd_list if pd_list else 'None'}", True, (0,0,0)), (10, 166))
+
+    # input box (with semi-transparent placeholder)
+    pygame.draw.rect(screen, (255,255,255), input_box)
+    pygame.draw.rect(screen, (0,0,0), input_box, 2)
+
+    if input_text:
+        # user typed text
+        txt_surface = font.render(input_text, True, (0,0,0))
+        screen.blit(txt_surface, (input_box.x + 6, input_box.y + 6))
+    else:
+        # placeholder (semi-transparent)
+        placeholder = 'press "exit" to exit simulator'
+        ph_surf = font.render(placeholder, True, (0,0,0))
+        ph_surf.set_alpha(110)   # 0..255 (lower = more transparent)
+        screen.blit(ph_surf, (input_box.x + 6, input_box.y + 6))
+
+    # caret (only when box active)
+    if input_active and caret_visible:
+        caret_text = input_text if input_text else ""
+        caret_x = input_box.x + 6 + font.size(caret_text)[0] + 2
+        pygame.draw.line(screen, (0,0,0), (caret_x, input_box.y + 6),
+                         (caret_x, input_box.y + input_box.height - 6), 2)
+
+    pygame.display.flip()
+
+pygame.quit()
+sys.exit()
